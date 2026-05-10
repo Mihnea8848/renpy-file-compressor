@@ -2,23 +2,11 @@ import io
 from pathlib import Path
 
 from PIL import Image
+from pillow_heif import register_heif_opener
+
+register_heif_opener()  # registers AVIF/HEIF support with Pillow globally
 
 IMAGE_EXTS = {".png", ".webp", ".jpg", ".jpeg", ".bmp", ".tga"}
-
-_avif_registered = False
-
-
-def _ensure_avif() -> None:
-    global _avif_registered
-    if not _avif_registered:
-        try:
-            import pillow_avif  # noqa: F401 — registers AVIF plugin with Pillow
-        except ImportError:
-            raise RuntimeError(
-                "pillow-avif-plugin is not installed.\n"
-                "Run: pip install pillow-avif-plugin"
-            )
-        _avif_registered = True
 
 
 def is_image(path: str) -> bool:
@@ -31,22 +19,14 @@ def avif_path(path: str) -> str:
 
 
 def convert_to_avif(data: bytes) -> bytes:
-    """Convert any supported image format to lossless AVIF and return the bytes."""
-    _ensure_avif()
+    """Convert any supported image format to high-quality AVIF and return the bytes."""
     img = Image.open(io.BytesIO(data))
-    # Preserve RGBA / palette modes that AVIF supports.
     if img.mode not in ("RGB", "RGBA"):
         img = img.convert("RGBA" if img.mode in ("P", "PA", "LA", "RGBX") else "RGB")
     out = io.BytesIO()
-    # 4:4:4 subsampling + lossless AOM flag = no chroma downsampling, no quantization loss.
-    # Max pixel diff in practice is ≤3 due to YUV↔RGB rounding in the AV1 pipeline.
-    img.save(
-        out,
-        format="AVIF",
-        qmin=0,
-        qmax=0,
-        subsampling="4:4:4",
-        codec="aom",
-        advanced={"lossless": "1"},
-    )
+    try:
+        img.save(out, format="AVIF", quality=85, speed=6, chroma="444")
+    except Exception:
+        out = io.BytesIO()
+        img.save(out, format="AVIF", quality=85, speed=6)
     return out.getvalue()

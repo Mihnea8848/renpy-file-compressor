@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import os
 import shutil
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -11,7 +13,7 @@ import customtkinter as ctk
 
 from core.converter import avif_path, convert_to_avif, is_image
 from core.rpa import iter_files, write_rpa
-from core.script_patcher import is_rpy, is_rpyc, patch_rpy
+from core.script_patcher import is_rpy, is_rpyc, patch_rpy_with_map
 from core.video_converter import av1_path, convert_to_av1, is_video
 from gui.wizard import C_ACCENT, C_BTN_SEC, C_BTN_SEC_H, C_FOOTER_SEP, C_TEXT, C_TEXT_SUB, C_WHITE
 
@@ -27,8 +29,24 @@ def _fmt_size(n: int) -> str:
     return f"{n:.1f} TB"
 
 
+def _fmt_time(secs: float) -> str:
+    s = int(secs)
+    if s < 60:
+        return f"{s}s"
+    m, s = divmod(s, 60)
+    if m < 60:
+        return f"{m}m {s:02d}s"
+    h, m = divmod(m, 60)
+    return f"{h}h {m:02d}m"
+
+
 def _ts() -> str:
     return datetime.now().strftime("%H:%M:%S")
+
+
+def _pct_str(original: int, output: int) -> str:
+    pct = (original - output) / max(original, 1) * 100
+    return f"-{pct:.0f}%" if pct >= 0 else f"+{abs(pct):.0f}% larger"
 
 
 class CompressPage(ctk.CTkFrame):
@@ -62,7 +80,7 @@ class CompressPage(ctk.CTkFrame):
 
         # Progress section
         prog = ctk.CTkFrame(self, fg_color=C_WHITE, corner_radius=0)
-        prog.grid(row=2, column=0, sticky="ew", padx=28, pady=(16, 0))
+        prog.grid(row=2, column=0, sticky="ew", padx=28, pady=(14, 0))
         prog.grid_columnconfigure(0, weight=1)
 
         ctk.CTkLabel(prog, text="Overall progress",
@@ -73,27 +91,40 @@ class CompressPage(ctk.CTkFrame):
             prog, height=14, corner_radius=3,
             fg_color="#e8e8e8", progress_color=C_ACCENT)
         self._overall_bar.set(0)
-        self._overall_bar.grid(row=1, column=0, sticky="ew", pady=(3, 8))
+        self._overall_bar.grid(row=1, column=0, sticky="ew", pady=(3, 3))
 
         self._overall_label = ctk.CTkLabel(
             prog, text="", font=ctk.CTkFont(size=11), text_color=C_TEXT_SUB, anchor="w")
         self._overall_label.grid(row=2, column=0, sticky="w")
 
-        ctk.CTkLabel(prog, text="Current file",
-                     font=ctk.CTkFont(size=11), text_color=C_TEXT_SUB,
-                     anchor="w").grid(row=3, column=0, sticky="w", pady=(8, 0))
+        # ETA / speed / elapsed row
+        self._eta_label = ctk.CTkLabel(
+            prog, text="",
+            font=ctk.CTkFont(size=11), text_color=C_TEXT_SUB, anchor="w")
+        self._eta_label.grid(row=3, column=0, sticky="w", pady=(1, 6))
+
+        # Archive context
+        self._arch_label = ctk.CTkLabel(
+            prog, text="",
+            font=ctk.CTkFont(size=11), text_color=C_TEXT_SUB, anchor="w")
+        self._arch_label.grid(row=4, column=0, sticky="w")
 
         self._file_bar = ctk.CTkProgressBar(
             prog, height=8, corner_radius=2,
             fg_color="#e8e8e8", progress_color="#27ae60")
         self._file_bar.set(0)
-        self._file_bar.grid(row=4, column=0, sticky="ew", pady=(3, 0))
+        self._file_bar.grid(row=5, column=0, sticky="ew", pady=(3, 2))
+
+        self._file_pct_label = ctk.CTkLabel(
+            prog, text="",
+            font=ctk.CTkFont(size=11), text_color=C_TEXT_SUB, anchor="w")
+        self._file_pct_label.grid(row=6, column=0, sticky="w")
 
         # Console log
         ctk.CTkLabel(self, text="Log",
                      font=ctk.CTkFont(size=11, weight="bold"),
                      text_color=C_TEXT_SUB, anchor="w").grid(
-            row=3, column=0, sticky="w", padx=28, pady=(14, 2))
+            row=3, column=0, sticky="w", padx=28, pady=(10, 2))
 
         self._log = ctk.CTkTextbox(
             self,
@@ -106,9 +137,8 @@ class CompressPage(ctk.CTkFrame):
             state="disabled",
             wrap="word",
         )
-        self._log.grid(row=5, column=0, sticky="nsew", padx=28, pady=(0, 10))
+        self._log.grid(row=5, column=0, sticky="nsew", padx=28, pady=(0, 8))
 
-        # Cancel
         self._cancel_btn = ctk.CTkButton(
             self, text="Cancel", width=90, height=28,
             fg_color=C_BTN_SEC, hover_color=C_BTN_SEC_H,
@@ -116,7 +146,7 @@ class CompressPage(ctk.CTkFrame):
             border_width=1, border_color=C_FOOTER_SEP,
             corner_radius=2, command=self._cancel,
         )
-        self._cancel_btn.grid(row=6, column=0, padx=28, pady=(0, 10), sticky="w")
+        self._cancel_btn.grid(row=6, column=0, padx=28, pady=(0, 8), sticky="w")
 
     # ── Lifecycle ──────────────────────────────────────────────────────────
     def on_show(self) -> None:
@@ -124,13 +154,16 @@ class CompressPage(ctk.CTkFrame):
         self._overall_bar.set(0)
         self._file_bar.set(0)
         self._overall_label.configure(text="")
+        self._eta_label.configure(text="")
+        self._arch_label.configure(text="")
+        self._file_pct_label.configure(text="")
         self._header_sub.configure(text="Preparing…")
         self._cancel_btn.configure(state="normal", text="Cancel")
         self._log_clear()
         threading.Thread(target=self._run, daemon=True).start()
 
     def on_next(self) -> None:
-        pass  # disabled during compression
+        pass
 
     def _cancel(self) -> None:
         self._cancel_event.set()
@@ -152,25 +185,62 @@ class CompressPage(ctk.CTkFrame):
             self._log.configure(state="disabled")
         self.after(0, _do)
 
-    def _log_info(self, msg: str) -> None:
-        self._log_write(msg, "#d4d4d4")
+    def _log_info(self, msg: str) -> None: self._log_write(msg, "#d4d4d4")
+    def _log_ok(self,   msg: str) -> None: self._log_write(msg, "#4ec9b0")
+    def _log_warn(self, msg: str) -> None: self._log_write(msg, "#ce9178")
+    def _log_error(self,msg: str) -> None: self._log_write(msg, "#f44747")
 
-    def _log_ok(self, msg: str) -> None:
-        self._log_write(msg, "#4ec9b0")
+    # ── Progress update helpers ────────────────────────────────────────────
+    def _update_overall(self, processed: int, total: int, saved: int,
+                        start_time: float) -> None:
+        frac = processed / max(total, 1)
+        elapsed = time.time() - start_time
 
-    def _log_warn(self, msg: str) -> None:
-        self._log_write(msg, "#ce9178")
+        # Speed / ETA
+        if processed > 0 and elapsed > 0.5:
+            speed = processed / elapsed
+            remaining = (total - processed) / speed
+            eta_text = (
+                f"Elapsed: {_fmt_time(elapsed)}  •  "
+                f"{speed:.1f} img/s  •  "
+                f"ETA: ~{_fmt_time(remaining)}"
+            )
+        elif elapsed > 0:
+            eta_text = f"Elapsed: {_fmt_time(elapsed)}"
+        else:
+            eta_text = ""
 
-    def _log_error(self, msg: str) -> None:
-        self._log_write(msg, "#f44747")
+        self.after(0, self._overall_bar.set, frac)
+        self.after(0, self._overall_label.configure, {
+            "text": (
+                f"{frac * 100:.0f}%  •  "
+                f"Saved {_fmt_size(max(0, saved))}  •  "
+                f"{processed} / {total} files"
+            )
+        })
+        self.after(0, self._eta_label.configure, {"text": eta_text})
+
+    def _update_arch(self, arch_desc: str, arch_conv: int,
+                     arch_saved: int, arch_skipped: int, extra: str = "") -> None:
+        parts = [arch_desc + extra]
+        if arch_conv > 0:
+            pct = arch_saved / arch_conv * 100
+            sign = "-" if pct >= 0 else "+"
+            parts.append(f"savings: {sign}{abs(pct):.0f}%")
+        if arch_skipped:
+            parts.append(f"{arch_skipped} kept original")
+        self.after(0, self._arch_label.configure, {"text"  : "  |  ".join(parts)})
 
     # ── Main compression thread ────────────────────────────────────────────
     def _run(self) -> None:
-        results  = self._wizard.app_state.get("scan_results", [])
-        backup   = self._wizard.app_state.get("backup", True)
-        game_dir = Path(self._wizard.app_state["game_folder"]) / "game"
+        results     = self._wizard.app_state.get("scan_results", [])
+        backup      = self._wizard.app_state.get("backup", True)
+        n_workers   = self._wizard.app_state.get(
+            "turbo_workers", max(1, (os.cpu_count() or 4) - 2)
+        )
+        game_dir    = Path(self._wizard.app_state["game_folder"]) / "game"
+        start_time  = time.time()
 
-        # --- Staging directory: originals are NEVER touched until all succeed ---
         stage_dir = game_dir / ".hhg_compress_stage"
         try:
             stage_dir.mkdir(exist_ok=True)
@@ -178,7 +248,7 @@ class CompressPage(ctk.CTkFrame):
             self._log_error(f"Cannot create staging directory: {e}")
             return
 
-        staged: dict[Path, Path] = {}          # original → staged temp file
+        staged: dict[Path, Path] = {}
         compress_results: list[dict] = []
         total_items = sum(r["images"] + r["videos"] for r in results)
         processed = 0
@@ -192,6 +262,15 @@ class CompressPage(ctk.CTkFrame):
                 rpa_path: Path = r["path"]
                 staged_path = stage_dir / rpa_path.name
 
+                parts = []
+                if r["images"]:  parts.append(f"{r['images']} images → AVIF")
+                if r["videos"]:  parts.append(f"{r['videos']} videos → AV1")
+                if r["scripts"]: parts.append(f"{r['scripts']} scripts")
+                arch_desc = (
+                    f"{rpa_path.name}  ({arch_idx + 1}/{len(results)})"
+                    + (f"  —  {', '.join(parts)}" if parts else "")
+                )
+                self.after(0, self._arch_label.configure, {"text": arch_desc})
                 self.after(0, self._header_sub.configure, {
                     "text": f"Archive {arch_idx + 1}/{len(results)}: {rpa_path.name}"
                 })
@@ -201,89 +280,199 @@ class CompressPage(ctk.CTkFrame):
                     f"{r['images']} images  •  {r['videos']} video(s))"
                 )
 
-                # Archives with nothing to do are copied as-is
                 if r["images"] == 0 and r["videos"] == 0 and r["scripts"] == 0:
-                    self._log_info(f"  No compressible content — skipping.")
+                    self._log_info("  No compressible content — skipping.")
                     compress_results.append({**r, "new_size": r["size"]})
                     continue
 
                 new_files: dict[str, bytes] = {}
                 file_list = list(iter_files(rpa_path))
-                total_in_arch = len(file_list)
 
-                for fi, (fpath, data) in enumerate(file_list):
-                    if self._cancel_event.is_set():
+                image_items  = [(fp, d) for fp, d in file_list if is_image(fp)]
+                video_items  = [(fp, d) for fp, d in file_list if is_video(fp)]
+                script_items = [(fp, d) for fp, d in file_list if is_rpy(fp)]
+
+                arch_conv_bytes  = 0
+                arch_saved_bytes = 0
+                arch_skipped     = 0
+                path_map: dict[str, str] = {}  # original_path → new_path (only converted files)
+
+                # ── Pass-through files (non-image, non-video, non-script) ──
+                for fpath, data in file_list:
+                    if (not is_image(fpath) and not is_video(fpath)
+                            and not is_rpy(fpath) and not is_rpyc(fpath)):
+                        new_files[fpath] = data
+                    elif is_rpyc(fpath):
+                        self._log_info(f"  BYT  {fpath}  (dropped — Ren'Py will recompile)")
+
+                # ── Images ───────────────────────────────────────────────
+                if n_workers > 1 and len(image_items) > 1:
+                    # Parallel path
+                    self._log_info(
+                        f"  Converting {len(image_items)} images in parallel "
+                        f"({n_workers} threads)…"
+                    )
+                    self.after(0, self._arch_label.configure,
+                               {"text": arch_desc + f"  |  {n_workers} threads"})
+
+                    executor = ThreadPoolExecutor(max_workers=n_workers)
+                    future_map = {
+                        executor.submit(convert_to_avif, data): (fpath, data)
+                        for fpath, data in image_items
+                    }
+                    img_done = 0
+                    cancelled = False
+                    for future in as_completed(future_map):
+                        if self._cancel_event.is_set():
+                            for f in future_map:
+                                f.cancel()
+                            cancelled = True
+                            break
+
+                        fpath, data = future_map[future]
+                        img_done += 1
+                        try:
+                            out = future.result()
+                            if len(out) < len(data):
+                                new_path = avif_path(fpath)
+                                new_files[new_path] = out
+                                path_map[fpath] = new_path
+                                delta = len(data) - len(out)
+                                arch_conv_bytes  += len(data)
+                                arch_saved_bytes += delta
+                                saved_bytes      += delta
+                                self._log_ok(
+                                    f"  IMG  {Path(fpath).name}  "
+                                    f"{_fmt_size(len(data))} → {_fmt_size(len(out))}  "
+                                    f"({_pct_str(len(data), len(out))})"
+                                )
+                            else:
+                                new_files[fpath] = data
+                                arch_skipped += 1
+                                self._log_info(
+                                    f"  KEPT {Path(fpath).name}  "
+                                    f"({_fmt_size(len(data))}, AVIF would be {_fmt_size(len(out))})"
+                                )
+                        except Exception as e:
+                            new_files[fpath] = data
+                            self._log_warn(f"  SKIP {Path(fpath).name}: {e}")
+                        processed += 1
+
+                        img_frac = img_done / max(len(image_items), 1)
+                        self.after(0, self._file_bar.set, img_frac)
+                        self.after(0, self._file_pct_label.configure, {
+                            "text": (
+                                f"parallel: {img_done} / {len(image_items)} images"
+                                f"  ({img_frac * 100:.0f}%)  •  {n_workers} threads"
+                            )
+                        })
+                        self._update_overall(processed, total_items, saved_bytes, start_time)
+                        self._update_arch(arch_desc, arch_conv_bytes, arch_saved_bytes,
+                                          arch_skipped, f"  |  {n_workers} threads")
+
+                    executor.shutdown(wait=False)
+                    if cancelled:
                         raise InterruptedError("Cancelled by user.")
 
-                    self.after(0, self._file_bar.set, fi / max(total_in_arch, 1))
+                else:
+                    # Sequential path
+                    for fi, (fpath, data) in enumerate(image_items):
+                        if self._cancel_event.is_set():
+                            raise InterruptedError("Cancelled by user.")
 
-                    if is_image(fpath):
+                        img_frac = fi / max(len(image_items) - 1, 1) if len(image_items) > 1 else 1.0
+                        self.after(0, self._file_bar.set, img_frac)
+                        self.after(0, self._file_pct_label.configure, {
+                            "text": f"image {fi + 1} of {len(image_items)}  ({img_frac * 100:.0f}%)"
+                        })
                         self._log_info(f"  IMG  {fpath}")
                         try:
                             out = convert_to_avif(data)
-                            new_path = avif_path(fpath)
-                            new_files[new_path] = out
-                            delta = len(data) - len(out)
-                            saved_bytes += delta
-                            self._log_ok(
-                                f"       → {new_path.split('/')[-1]}  "
-                                f"{_fmt_size(len(data))} → {_fmt_size(len(out))}  "
-                                f"(-{delta / max(len(data), 1) * 100:.0f}%)"
-                            )
+                            if len(out) < len(data):
+                                new_path = avif_path(fpath)
+                                new_files[new_path] = out
+                                path_map[fpath] = new_path
+                                delta = len(data) - len(out)
+                                arch_conv_bytes  += len(data)
+                                arch_saved_bytes += delta
+                                saved_bytes      += delta
+                                self._log_ok(
+                                    f"       → {Path(new_path).name}  "
+                                    f"{_fmt_size(len(data))} → {_fmt_size(len(out))}  "
+                                    f"({_pct_str(len(data), len(out))})"
+                                )
+                            else:
+                                new_files[fpath] = data
+                                arch_skipped += 1
+                                self._log_info(
+                                    f"       KEPT  {_fmt_size(len(data))}, "
+                                    f"AVIF would be {_fmt_size(len(out))}"
+                                )
                         except Exception as e:
-                            self._log_warn(f"       SKIP (convert failed): {e}")
                             new_files[fpath] = data
+                            self._log_warn(f"       SKIP (convert failed): {e}")
                         processed += 1
 
-                    elif is_video(fpath):
-                        ext = Path(fpath).suffix
-                        self._log_info(f"  VID  {fpath}")
-                        try:
-                            out = convert_to_av1(data, ext)
+                        self._update_overall(processed, total_items, saved_bytes, start_time)
+                        self._update_arch(arch_desc, arch_conv_bytes, arch_saved_bytes, arch_skipped)
+
+                # ── Videos (sequential; ffmpeg is internally multi-threaded) ──
+                for fi, (fpath, data) in enumerate(video_items):
+                    if self._cancel_event.is_set():
+                        raise InterruptedError("Cancelled by user.")
+
+                    ext = Path(fpath).suffix
+                    self._log_info(f"  VID  {fpath}")
+                    vid_frac = fi / max(len(video_items) - 1, 1) if len(video_items) > 1 else 1.0
+                    self.after(0, self._file_bar.set, vid_frac)
+                    self.after(0, self._file_pct_label.configure, {
+                        "text": f"video {fi + 1} of {len(video_items)}"
+                    })
+                    try:
+                        out = convert_to_av1(data, ext)
+                        if len(out) < len(data):
                             new_path = av1_path(fpath)
                             new_files[new_path] = out
+                            path_map[fpath] = new_path
                             delta = len(data) - len(out)
                             saved_bytes += delta
                             self._log_ok(
                                 f"       → {Path(new_path).name}  "
                                 f"{_fmt_size(len(data))} → {_fmt_size(len(out))}  "
-                                f"(-{delta / max(len(data), 1) * 100:.0f}%)"
+                                f"({_pct_str(len(data), len(out))})"
                             )
-                        except Exception as e:
-                            self._log_warn(f"       SKIP (encode failed): {e}")
+                        else:
                             new_files[fpath] = data
-                        processed += 1
-
-                    elif is_rpy(fpath):
-                        self._log_info(f"  SCR  {fpath}  (patching extensions)")
-                        new_files[fpath] = patch_rpy(data)
-
-                    elif is_rpyc(fpath):
-                        self._log_info(f"  BYT  {fpath}  (dropped — Ren'Py will recompile)")
-                        # intentionally not added to new_files
-
-                    else:
+                            arch_skipped += 1
+                            self._log_info(
+                                f"       KEPT  {_fmt_size(len(data))}, "
+                                f"AV1 would be {_fmt_size(len(out))}"
+                            )
+                    except Exception as e:
                         new_files[fpath] = data
+                        self._log_warn(f"       SKIP (encode failed): {e}")
+                    processed += 1
 
-                    # Update overall bar
-                    overall_frac = processed / max(total_items, 1)
-                    self.after(0, self._overall_bar.set, overall_frac)
-                    self.after(0, self._overall_label.configure, {
-                        "text": f"Saved {_fmt_size(max(0, saved_bytes))} so far  •  "
-                                f"{processed}/{total_items} files"
-                    })
+                    self._update_overall(processed, total_items, saved_bytes, start_time)
+                    self._update_arch(arch_desc, arch_conv_bytes, arch_saved_bytes, arch_skipped)
 
-                # Write the staged file
-                self._log_info(f"  Writing staged archive…")
+                # ── Scripts: only patch paths that were actually converted ──
+                for fpath, data in script_items:
+                    self._log_info(f"  SCR  {fpath}  ({len(path_map)} path substitutions)")
+                    new_files[fpath] = patch_rpy_with_map(data, path_map)
+
+                # Write staged archive
+                self._log_info("  Writing staged archive…")
                 write_rpa(staged_path, new_files)
                 new_size = staged_path.stat().st_size
                 staged[rpa_path] = staged_path
                 compress_results.append({**r, "new_size": new_size})
                 self._log_ok(
                     f"  Staged: {_fmt_size(r['size'])} → {_fmt_size(new_size)}"
+                    + (f"  ({arch_skipped} file(s) kept as original)" if arch_skipped else "")
                 )
 
-            # ── All archives staged successfully — now do the atomic swap ──
+            # ── All archives staged — atomic swap ──────────────────────────
             if self._cancel_event.is_set():
                 raise InterruptedError("Cancelled by user.")
 
@@ -300,12 +489,17 @@ class CompressPage(ctk.CTkFrame):
                 s_path.rename(orig_path)
                 self._log_ok(f"  Replaced: {orig_path.name}")
 
+            total_elapsed = time.time() - start_time
+            self._log_ok(
+                f"Done in {_fmt_time(total_elapsed)}  •  "
+                f"Saved {_fmt_size(max(0, saved_bytes))} total"
+            )
             shutil.rmtree(stage_dir, ignore_errors=True)
             self._wizard.app_state["compress_results"] = compress_results
             self.after(0, self._on_done, True)
 
-        except InterruptedError as e:
-            self._log_warn(f"Cancelled — cleaning up staging directory…")
+        except InterruptedError:
+            self._log_warn("Cancelled — cleaning up staging directory…")
             shutil.rmtree(stage_dir, ignore_errors=True)
             self._log_ok("Staging cleaned up. Original files are untouched.")
             self.after(0, self._on_done, False)

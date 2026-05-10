@@ -21,3 +21,15 @@ def patch_rpy(content: bytes) -> bytes:
     content = _IMG_PATTERN.sub(b".avif", content)
     content = _VID_REMAP_PATTERN.sub(b".webm", content)
     return content
+
+
+def patch_rpy_with_map(content: bytes, path_map: dict[str, str]) -> bytes:
+    """Selectively replace only the paths that were actually converted.
+
+    path_map: {original_archive_path → new_archive_path}
+    Only referenced paths present in the map are touched — files kept as
+    originals (AVIF would be larger) are intentionally left unchanged.
+    """
+    for old, new in path_map.items():
+        content = content.replace(old.encode(), new.encode())
+    return content

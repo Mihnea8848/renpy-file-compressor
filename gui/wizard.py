@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -66,6 +67,7 @@ class Wizard(ctk.CTk):
         self.app_state: dict = {
             "game_folder": "",
             "backup": True,
+            "turbo_workers": max(1, (os.cpu_count() or 4) - 2),
             "scan_results": None,
             "compress_results": None,
         }
