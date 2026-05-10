@@ -1,7 +1,11 @@
 import re
 from pathlib import Path
 
-_EXT_PATTERN = re.compile(rb"\.(png|webp|jpg|jpeg|bmp|tga)", re.IGNORECASE)
+# Image extensions → .avif
+_IMG_PATTERN = re.compile(rb"\.(png|webp|jpg|jpeg|bmp|tga)", re.IGNORECASE)
+
+# Video extensions that get re-mapped to .webm (ogv/avi/mkv/mov → webm)
+_VID_REMAP_PATTERN = re.compile(rb"\.(ogv|avi|mkv|mov)", re.IGNORECASE)
 
 
 def is_rpy(path: str) -> bool:
@@ -13,5 +17,7 @@ def is_rpyc(path: str) -> bool:
 
 
 def patch_rpy(content: bytes) -> bytes:
-    """Replace image extension references in a .rpy source file with .avif."""
-    return _EXT_PATTERN.sub(b".avif", content)
+    """Replace image and remapped video extension references in a .rpy source file."""
+    content = _IMG_PATTERN.sub(b".avif", content)
+    content = _VID_REMAP_PATTERN.sub(b".webm", content)
+    return content
