@@ -14,7 +14,7 @@ import customtkinter as ctk
 from core.converter import avif_path, convert_to_avif, is_image
 from core.rpa import iter_files, write_rpa
 from core.script_patcher import is_rpy, is_rpyc, patch_rpy_with_map
-from core.video_converter import av1_path, convert_to_av1, is_video
+from core.video_converter import video_path, convert_video, is_video
 from gui.wizard import C_ACCENT, C_BTN_SEC, C_BTN_SEC_H, C_FOOTER_SEP, C_TEXT, C_TEXT_SUB, C_WHITE
 
 if TYPE_CHECKING:
@@ -253,6 +253,9 @@ class CompressPage(ctk.CTkFrame):
         total_items = sum(r["images"] + r["videos"] for r in results)
         processed = 0
         saved_bytes = 0
+        # Global map accumulates across ALL archives so scripts in one archive
+        # can reference images converted in a different archive.
+        global_path_map: dict[str, str] = {}
 
         try:
             for arch_idx, r in enumerate(results):
@@ -264,7 +267,7 @@ class CompressPage(ctk.CTkFrame):
 
                 parts = []
                 if r["images"]:  parts.append(f"{r['images']} images → AVIF")
-                if r["videos"]:  parts.append(f"{r['videos']} videos → AV1")
+                if r["videos"]:  parts.append(f"{r['videos']} videos → VP9")
                 if r["scripts"]: parts.append(f"{r['scripts']} scripts")
                 arch_desc = (
                     f"{rpa_path.name}  ({arch_idx + 1}/{len(results)})"
@@ -288,14 +291,16 @@ class CompressPage(ctk.CTkFrame):
                 new_files: dict[str, bytes] = {}
                 file_list = list(iter_files(rpa_path))
 
-                image_items  = [(fp, d) for fp, d in file_list if is_image(fp)]
+                # gui/ images are referenced by hardcoded paths compiled into .rpyc bytecode,
+                # which our script patcher cannot update. Keep them as-is.
+                image_items  = [(fp, d) for fp, d in file_list if is_image(fp) and not fp.startswith("gui/")]
                 video_items  = [(fp, d) for fp, d in file_list if is_video(fp)]
                 script_items = [(fp, d) for fp, d in file_list if is_rpy(fp)]
 
                 arch_conv_bytes  = 0
                 arch_saved_bytes = 0
                 arch_skipped     = 0
-                path_map: dict[str, str] = {}  # original_path → new_path (only converted files)
+                arch_path_map: dict[str, str] = {}  # conversions within this archive
 
                 # ── Pass-through files (non-image, non-video, non-script) ──
                 for fpath, data in file_list:
@@ -303,7 +308,9 @@ class CompressPage(ctk.CTkFrame):
                             and not is_rpy(fpath) and not is_rpyc(fpath)):
                         new_files[fpath] = data
                     elif is_rpyc(fpath):
-                        self._log_info(f"  BYT  {fpath}  (dropped — Ren'Py will recompile)")
+                        new_files[fpath] = data  # keep compiled scripts intact
+                    elif is_image(fpath) and fpath.startswith("gui/"):
+                        new_files[fpath] = data  # gui/ images have hardcoded .rpyc paths
 
                 # ── Images ───────────────────────────────────────────────
                 if n_workers > 1 and len(image_items) > 1:
@@ -336,7 +343,7 @@ class CompressPage(ctk.CTkFrame):
                             if len(out) < len(data):
                                 new_path = avif_path(fpath)
                                 new_files[new_path] = out
-                                path_map[fpath] = new_path
+                                arch_path_map[fpath] = new_path
                                 delta = len(data) - len(out)
                                 arch_conv_bytes  += len(data)
                                 arch_saved_bytes += delta
@@ -391,7 +398,7 @@ class CompressPage(ctk.CTkFrame):
                             if len(out) < len(data):
                                 new_path = avif_path(fpath)
                                 new_files[new_path] = out
-                                path_map[fpath] = new_path
+                                arch_path_map[fpath] = new_path
                                 delta = len(data) - len(out)
                                 arch_conv_bytes  += len(data)
                                 arch_saved_bytes += delta
@@ -429,11 +436,11 @@ class CompressPage(ctk.CTkFrame):
                         "text": f"video {fi + 1} of {len(video_items)}"
                     })
                     try:
-                        out = convert_to_av1(data, ext)
+                        out = convert_video(data, ext)
                         if len(out) < len(data):
-                            new_path = av1_path(fpath)
+                            new_path = video_path(fpath)
                             new_files[new_path] = out
-                            path_map[fpath] = new_path
+                            arch_path_map[fpath] = new_path
                             delta = len(data) - len(out)
                             saved_bytes += delta
                             self._log_ok(
@@ -446,7 +453,7 @@ class CompressPage(ctk.CTkFrame):
                             arch_skipped += 1
                             self._log_info(
                                 f"       KEPT  {_fmt_size(len(data))}, "
-                                f"AV1 would be {_fmt_size(len(out))}"
+                                f"VP9 would be {_fmt_size(len(out))}"
                             )
                     except Exception as e:
                         new_files[fpath] = data
@@ -456,10 +463,16 @@ class CompressPage(ctk.CTkFrame):
                     self._update_overall(processed, total_items, saved_bytes, start_time)
                     self._update_arch(arch_desc, arch_conv_bytes, arch_saved_bytes, arch_skipped)
 
-                # ── Scripts: only patch paths that were actually converted ──
+                # ── Accumulate into global map (for cross-archive patching) ──
+                global_path_map.update(arch_path_map)
+
+                # ── Scripts: patch with global map so scripts in one archive ──
+                # ── can reference images converted in a different archive     ──
                 for fpath, data in script_items:
-                    self._log_info(f"  SCR  {fpath}  ({len(path_map)} path substitutions)")
-                    new_files[fpath] = patch_rpy_with_map(data, path_map)
+                    self._log_info(
+                        f"  SCR  {fpath}  ({len(global_path_map)} path substitutions)"
+                    )
+                    new_files[fpath] = patch_rpy_with_map(data, global_path_map)
 
                 # Write staged archive
                 self._log_info("  Writing staged archive…")
@@ -488,6 +501,19 @@ class CompressPage(ctk.CTkFrame):
                     orig_path.unlink()
                 s_path.rename(orig_path)
                 self._log_ok(f"  Replaced: {orig_path.name}")
+
+            # Deploy AVIF runtime support script so the game can load .avif files.
+            # Overwrite every run so a stale/missing copy is never an issue.
+            _script_src = Path(__file__).parent.parent.parent / "core" / "avif_support_script.rpy"
+            _script_dst = game_dir / "hhg_avif_support.rpy"
+            _rpyc_dst   = game_dir / "hhg_avif_support.rpyc"
+            try:
+                shutil.copy2(_script_src, _script_dst)
+                if _rpyc_dst.exists():
+                    _rpyc_dst.unlink()
+                self._log_ok("Deployed hhg_avif_support.rpy → game/")
+            except Exception as _e:
+                self._log_warn(f"Could not deploy avif support script: {_e}")
 
             total_elapsed = time.time() - start_time
             self._log_ok(

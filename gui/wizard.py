@@ -83,7 +83,7 @@ class Wizard(ctk.CTk):
         self.grid_columnconfigure(0, minsize=BANNER_W, weight=0)
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
-        self.grid_rowconfigure(1, minsize=54, weight=0)
+        self.grid_rowconfigure(1, weight=0)
 
         # Left banner
         self._banner_frame = ctk.CTkFrame(
@@ -103,35 +103,35 @@ class Wizard(ctk.CTk):
         )
         self._content_frame.grid(row=0, column=1, sticky="nsew")
 
-        # Footer
+        # Footer — self-sizing via pack so height matches buttons at any DPI
         self._footer = ctk.CTkFrame(
-            self, fg_color=C_FOOTER_BG, corner_radius=0,
-            border_width=0,
+            self, fg_color=C_FOOTER_BG, corner_radius=0, border_width=0,
         )
-        self._footer.grid(row=1, column=1, sticky="nsew")
-        self._footer.grid_propagate(False)
+        self._footer.grid(row=1, column=1, sticky="ew")
 
-        # Thin top separator line on footer
         ctk.CTkFrame(
             self._footer, height=1, fg_color=C_FOOTER_SEP, corner_radius=0
-        ).place(x=0, y=0, relwidth=1)
+        ).pack(side="top", fill="x")
+
+        _btn_row = ctk.CTkFrame(self._footer, fg_color="transparent")
+        _btn_row.pack(side="top", fill="x", padx=0, pady=0)
+
+        self._btn_next = ctk.CTkButton(
+            _btn_row, text="Next >", width=100, height=32,
+            fg_color=C_ACCENT, hover_color=C_ACCENT_HOV,
+            text_color="#ffffff", font=ctk.CTkFont(size=12),
+            corner_radius=2, command=self._go_next,
+        )
+        self._btn_next.pack(side="right", padx=(4, 12), pady=8)
 
         self._btn_back = ctk.CTkButton(
-            self._footer, text="< Back", width=90, height=32,
+            _btn_row, text="< Back", width=90, height=32,
             fg_color=C_BTN_SEC, hover_color=C_BTN_SEC_H,
             text_color=C_TEXT, font=ctk.CTkFont(size=12),
             border_width=1, border_color=C_FOOTER_SEP,
             corner_radius=2, command=self._go_back,
         )
-        self._btn_back.place(relx=0.68, rely=0.56, anchor="center")
-
-        self._btn_next = ctk.CTkButton(
-            self._footer, text="Next >", width=100, height=32,
-            fg_color=C_ACCENT, hover_color=C_ACCENT_HOV,
-            text_color="#ffffff", font=ctk.CTkFont(size=12),
-            corner_radius=2, command=self._go_next,
-        )
-        self._btn_next.place(relx=0.84, rely=0.56, anchor="center")
+        self._btn_back.pack(side="right", padx=(0, 4), pady=8)
 
     def _load_pages(self) -> None:
         from gui.pages.welcome import WelcomePage

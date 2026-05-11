@@ -61,7 +61,7 @@ class WelcomePage(ctk.CTkFrame):
 
         steps = [
             ("Images",  "Convert PNG / WebP / JPG images to lossless AVIF — typically 20–70% smaller."),
-            ("Movies",  "Re-encode video files to AV1, achieving 40–60% smaller files."),
+            ("Movies",  "Re-encode video files to VP9, achieving 40–60% smaller files."),
             ("Scripts", "Update .rpy script files to reference the new file formats."),
             ("Safety",  "All changes are staged before any original file is touched.\n"
                         "If anything fails or you cancel, your game files are left intact."),
